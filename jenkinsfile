@@ -18,8 +18,8 @@ pipeline {
         FRONTEND_IMAGE = "kamkhede/student-task-frontend"
         
         // GitOps Manifest Paths
-        BACKEND_YAML = "student-task-manager/k8s/backend-deployment.yaml"
-        FRONTEND_YAML = "student-task-manager/k8s/frontend-deployment.yaml"
+        BACKEND_YAML = "/k8s/backend-deployment.yaml"
+        FRONTEND_YAML = "/k8s/frontend-deployment.yaml"
         GIT_BRANCH = "main" 
     }
 
