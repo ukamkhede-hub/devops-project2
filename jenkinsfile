@@ -1,84 +1,185 @@
 pipeline {
-
     agent any
 
-    environment {
-        DOCKER_USER = "kamkhede"
+    options {
+        // Architecture Best Practices: 
+        // 1. Prevent race conditions if multiple developers push code simultaneously.
+        disableConcurrentBuilds()
+        // 2. Keep the Jenkins server disk clean by discarding old build logs.
+        buildDiscarder(logRotator(numToKeepStr: '10', artifactNumToKeepStr: '10'))
+        // 3. Prevent hanging pipelines from consuming resources indefinitely.
+        timeout(time: 30, unit: 'MINUTES')
+    }
 
+    environment {
+        // Container Registry Configuration
+        DOCKER_USER = "kamkhede"
         BACKEND_IMAGE = "kamkhede/student-task-backend"
         FRONTEND_IMAGE = "kamkhede/student-task-frontend"
+        
+        // GitOps Manifest Paths
+        BACKEND_YAML = "student-task-manager/k8s/backend-deployment.yaml"
+        FRONTEND_YAML = "student-task-manager/k8s/frontend-deployment.yaml"
+        GIT_BRANCH = "main" 
     }
 
     stages {
-
-        stage("Checkout") {
+        stage("Checkout Workspace") {
             steps {
                 checkout scm
             }
         }
 
-        stage("Docker Login") {
-            steps {
-                withCredentials([
-                    usernamePassword(
-                        credentialsId: "docker-hub-cred",
-                        usernameVariable: "DOCKER_USERNAME",
-                        passwordVariable: "DOCKER_PASSWORD"
-                    )
-                ]) {
-                    sh '''
-                        echo "$DOCKER_PASSWORD" | docker login \
-                        -u "$DOCKER_USERNAME" \
-                        --password-stdin
-                    '''
+        // Nested stages wrapped in a logic gate to handle the CI webhook loop
+        stage("CI/CD Pipeline Core") {
+            when {
+                expression {
+                    // Extract the latest commit message payload
+                    def commitMsg = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+                    
+                    // Break the execution chain if the commit originated from Jenkins
+                    if (commitMsg.contains('[ci skip]')) {
+                        echo "🛑 [SYSTEM HALT] Automated Jenkins commit detected. Bypassing build to prevent infinite CI loops."
+                        return false 
+                    }
+                    
+                    echo "✅ [SYSTEM GO] Manual developer commit detected. Initializing standard build sequence."
+                    return true 
                 }
             }
-        }
+            
+            stages {
+                stage("Semantic Version Calculation") {
+                    steps {
+                        script {
+                            // Extracting current version from YAML to maintain a strict Single Source of Truth (SSOT)
+                            env.IMAGE_TAG = sh(
+                                script: '''
+                                    set -e
+                                    # Isolate the tag string, strip whitespace and carriage returns
+                                    CURRENT_TAG=$(grep 'student-task-frontend:' ${FRONTEND_YAML} | awk -F':' '{print $3}' | tr -d ' \r')
+                                    
+                                    BASE_VERSION=$(echo $CURRENT_TAG | cut -d. -f1,2)
+                                    PATCH_VERSION=$(echo $CURRENT_TAG | cut -d. -f3)
+                                    NEXT_PATCH=$((PATCH_VERSION + 1))
+                                    
+                                    echo "${BASE_VERSION}.${NEXT_PATCH}"
+                                ''',
+                                returnStdout: true
+                            ).trim()
+                            echo "🚀 Target Image Tag Resolved: ${env.IMAGE_TAG}"
+                        }
+                    }
+                }
 
-        stage("Build Backend") {
-            steps {
-                sh '''
-                    docker build \
-                    -t ${BACKEND_IMAGE}:latest \
-                    ./backend
-                '''
-            }
-        }
+                stage("Authenticate Container Registry") {
+                    steps {
+                        withCredentials([
+                            usernamePassword(
+                                credentialsId: "docker-hub-cred", 
+                                usernameVariable: "DOCKER_USERNAME",
+                                passwordVariable: "DOCKER_PASSWORD"
+                            )
+                        ]) {
+                            // 'set -e' ensures the script fails immediately if authentication drops
+                            sh '''
+                                set -e
+                                echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+                            '''
+                        }
+                    }
+                }
 
-        stage("Build Frontend") {
-            steps {
-                sh '''
-                    docker build \
-                    -t ${FRONTEND_IMAGE}:latest \
-                    ./frontend
-                '''
-            }
-        }
+                // Parallel processing minimizes build time by running disconnected processes concurrently
+                stage("Build Container Artifacts") {
+                    parallel {
+                        stage("Backend Module") {
+                            steps {
+                                sh '''
+                                    set -e
+                                    docker build \
+                                        -t ${BACKEND_IMAGE}:${IMAGE_TAG} \
+                                        -t ${BACKEND_IMAGE}:latest \
+                                        ./backend
+                                '''
+                            }
+                        }
+                        stage("Frontend Module") {
+                            steps {
+                                sh '''
+                                    set -e
+                                    docker build \
+                                        -t ${FRONTEND_IMAGE}:${IMAGE_TAG} \
+                                        -t ${FRONTEND_IMAGE}:latest \
+                                        ./frontend
+                                '''
+                            }
+                        }
+                    }
+                }
 
-        stage("Push Images") {
-            steps {
-                sh '''
-                    docker push ${BACKEND_IMAGE}:latest
-                    docker push ${FRONTEND_IMAGE}:latest
-                '''
+                stage("Publish Artifacts to Registry") {
+                    steps {
+                        sh '''
+                            set -e
+                            docker push ${BACKEND_IMAGE}:${IMAGE_TAG}
+                            docker push ${BACKEND_IMAGE}:latest
+                            docker push ${FRONTEND_IMAGE}:${IMAGE_TAG}
+                            docker push ${FRONTEND_IMAGE}:latest
+                        '''
+                    }
+                }
+
+                stage("Patch K8s Manifests & Push (GitOps)") {
+                    steps {
+                        withCredentials([
+                            usernamePassword(
+                                credentialsId: "github-cred", 
+                                usernameVariable: "GIT_USERNAME",
+                                passwordVariable: "GIT_TOKEN"
+                            )
+                        ]) {
+                            sh '''
+                                set -e
+                                # 1. Inject newly compiled tags into Kubernetes deployment definitions
+                                sed -i "s|${BACKEND_IMAGE}:.*|${BACKEND_IMAGE}:${IMAGE_TAG}|g" ${BACKEND_YAML}
+                                sed -i "s|${FRONTEND_IMAGE}:.*|${FRONTEND_IMAGE}:${IMAGE_TAG}|g" ${FRONTEND_YAML}
+
+                                # 2. Establish Jenkins service account identity for the Git transaction
+                                git config user.name "Jenkins CI Bot"
+                                git config user.email "jenkins-bot@architecture.local"
+
+                                # 3. Stage and commit files, strictly embedding the CI escape clause
+                                git add ${BACKEND_YAML} ${FRONTEND_YAML}
+                                git commit -m "chore(k8s): bump image versions to ${IMAGE_TAG} [ci skip]" || echo "No delta detected. Bypassing commit."
+
+                                # 4. Execute authenticated network push back to the origin
+                                REPO_URL=$(git config --get remote.origin.url | sed 's|https://||')
+                                git push https://${GIT_USERNAME}:${GIT_TOKEN}@${REPO_URL} HEAD:${GIT_BRANCH}
+                            '''
+                        }
+                    }
+                }
             }
         }
     }
 
     post {
-
         success {
-            echo "Docker images built and pushed successfully!"
+            echo "✅ [SUCCESS] Pipeline execution verified. GitOps state synchronised to version ${env.IMAGE_TAG}."
         }
-
         failure {
-            echo "Pipeline failed!"
+            echo "❌ [FATAL ERROR] Pipeline sequence compromised. Review shell outputs for stack trace analytics."
         }
-
         always {
-            sh '''
-                docker logout || true
-            '''
+            script {
+                echo "🧹 [TEARDOWN] Purging transient Docker authentication tokens from host."
+                try {
+                    sh 'docker logout || true'
+                } catch (Exception e) {
+                    echo "Teardown exception intercepted: ${e.message}"
+                }
+            }
         }
     }
 }

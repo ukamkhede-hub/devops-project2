@@ -25,7 +25,7 @@ spec:
 
         - name: frontend
 
-          image: kamkhede/student-task-frontend:latest
+          image: kamkhede/student-task-frontend:v1.0.0
 
           imagePullPolicy: Always
 
